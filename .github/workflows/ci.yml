@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+      - name: Syntax check
+        run: |
+          bash -n bin/bluetooth_unlock install.sh
+          sh -n bin/hdparm_add_bluetooth_unlock
+      - name: ShellCheck
+        run: |
+          shellcheck bin/bluetooth_unlock bin/hdparm_add_bluetooth_unlock install.sh

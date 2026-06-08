@@ -1,0 +1,115 @@
+#!/bin/sh
+set -eu
+
+script=$(basename "$(readlink -nf "$0")")
+echo "Started running script $script"
+
+usage() {
+  cat <<EOF
+Usage:
+  $script MAC_ADDRESS
+
+Example:
+  $script AA:BB:CC:DD:EE:FF
+EOF
+}
+
+validate_mac_address() {
+  printf '%s\n' "$1" | grep -Eiq '^[0-9a-f]{2}(:[0-9a-f]{2}){5}$'
+}
+
+if [ "$#" -ne 1 ]; then
+  usage >&2
+  exit 1
+fi
+
+mac_address="$1"
+
+if ! validate_mac_address "$mac_address"; then
+  echo "Invalid Bluetooth MAC address: $mac_address" >&2
+  exit 1
+fi
+
+resolve_target_user() {
+  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    printf '%s\n' "$SUDO_USER"
+    return 0
+  fi
+
+  if [ -n "${USER:-}" ] && [ "$USER" != "root" ]; then
+    printf '%s\n' "$USER"
+    return 0
+  fi
+
+  login_name="$(logname 2>/dev/null || true)"
+  if [ -n "$login_name" ] && [ "$login_name" != "root" ]; then
+    printf '%s\n' "$login_name"
+    return 0
+  fi
+
+  passwd_user="$(awk -F: '$3 >= 1000 && $3 < 60000 && $1 != "nobody" { print $1; exit }' /etc/passwd)"
+  if [ -n "$passwd_user" ]; then
+    printf '%s\n' "$passwd_user"
+    return 0
+  fi
+
+  return 1
+}
+
+user="$(resolve_target_user || true)"
+if [ -z "$user" ]; then
+  echo "Unable to determine which non-root user owns bluetooth_unlock" >&2
+  exit 1
+fi
+
+home="$(getent passwd "$user" | cut -d: -f6)"
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+unlock_script="$script_dir/bluetooth_unlock"
+sleep_hook="/usr/lib/systemd/system-sleep/bluetooth-unlock"
+
+if [ -z "$home" ] || [ ! -d "$home" ]; then
+  echo "Unable to resolve home directory for user '$user'" >&2
+  exit 1
+fi
+
+if [ ! -x "$unlock_script" ]; then
+  echo "bluetooth_unlock not found or not executable: $unlock_script" >&2
+  exit 1
+fi
+
+echo "Using user '$user'"
+echo "Using unlock script '$unlock_script'"
+echo "Using Bluetooth MAC '$mac_address'"
+
+sudo tee "$sleep_hook" >/dev/null <<EOF_HOOK
+#!/bin/sh
+# Managed by bluetooth-unlock.
+case \$1 in
+  post)
+    if command -v pkill >/dev/null 2>&1; then
+      pkill -f "$unlock_script" >/dev/null 2>&1 || true
+    fi
+
+    if command -v systemd-run >/dev/null 2>&1; then
+      unit="bluetooth-unlock-\$(date +%s%N)"
+      systemd-run --quiet --collect --unit "\$unit" \
+        --property=Type=simple \
+        --property=RuntimeMaxSec=120 \
+        "$unlock_script" "$mac_address" >/dev/null 2>&1 || logger -t bluetooth_unlock_hook "Failed to launch $unlock_script via systemd-run"
+    else
+      nohup "$unlock_script" "$mac_address" >/dev/null 2>&1 &
+      if [ \$? -ne 0 ]; then
+        logger -t bluetooth_unlock_hook "Failed to launch $unlock_script via nohup"
+      fi
+    fi
+    ;;
+esac
+EOF_HOOK
+
+sudo chmod 0755 "$sleep_hook"
+sudo systemctl daemon-reload
+
+# Clear old runtime debug logs from previous versions.
+sudo rm -f /run/bluetooth_unlock.log /run/bluetooth_unlock.nohup.log 2>/dev/null || true
+
+echo "Installed $sleep_hook"

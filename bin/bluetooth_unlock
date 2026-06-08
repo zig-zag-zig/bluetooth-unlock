@@ -1,0 +1,381 @@
+#!/bin/bash
+# shellcheck disable=SC2317,SC2329
+
+usage() {
+    cat <<EOF
+Usage:
+  bluetooth_unlock MAC_ADDRESS
+
+Example:
+  bluetooth_unlock AA:BB:CC:DD:EE:FF
+EOF
+}
+
+if [[ "$#" -ne 1 ]]; then
+    usage >&2
+    exit 1
+fi
+
+mac_address="$1"
+timeout_seconds="${BLUETOOTH_UNLOCK_TIMEOUT_SECONDS:-45}"
+poll_interval_seconds="${BLUETOOTH_UNLOCK_POLL_INTERVAL_SECONDS:-1}"
+probe_timeout_seconds="${BLUETOOTH_UNLOCK_PROBE_TIMEOUT_SECONDS:-2}"
+resume_settle_seconds="${BLUETOOTH_UNLOCK_RESUME_SETTLE_SECONDS:-3}"
+connect_timeout_seconds="${BLUETOOTH_UNLOCK_CONNECT_TIMEOUT_SECONDS:-6}"
+connect_retry_seconds="${BLUETOOTH_UNLOCK_CONNECT_RETRY_SECONDS:-3}"
+connect_busy_retry_seconds="${BLUETOOTH_UNLOCK_CONNECT_BUSY_RETRY_SECONDS:-8}"
+min_rssi="${BLUETOOTH_UNLOCK_MIN_RSSI:--127}"
+l2ping_timeout_seconds="${BLUETOOTH_UNLOCK_L2PING_TIMEOUT_SECONDS:-3}"
+lock_file="/run/bluetooth_unlock.lock"
+log_file="${BLUETOOTH_UNLOCK_LOG_FILE:-/run/bluetooth_unlock.log}"
+log_tag="${BLUETOOTH_UNLOCK_LOG_TAG:-bluetooth_unlock}"
+debug_enabled="${BLUETOOTH_UNLOCK_DEBUG:-0}"
+run_id="${BLUETOOTH_UNLOCK_RUN_ID:-$$-$(date +%s)}"
+
+if [[ ! "$mac_address" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]]; then
+    echo "Invalid Bluetooth MAC address: $mac_address" >&2
+    exit 1
+fi
+
+is_truthy() {
+    case "${1,,}" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+log_line() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp
+
+    timestamp="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+    printf '%s [%s] [%s] %s\n' "$timestamp" "$level" "$run_id" "$message" >>"$log_file" 2>/dev/null || true
+
+    if command -v logger >/dev/null 2>&1; then
+        logger -t "$log_tag" "[$level] [$run_id] $message" 2>/dev/null || true
+    fi
+}
+
+log_info() {
+    log_line "INFO" "$*"
+}
+
+log_warn() {
+    log_line "WARN" "$*"
+}
+
+log_error() {
+    log_line "ERROR" "$*"
+}
+
+log_debug() {
+    if is_truthy "$debug_enabled"; then
+        log_line "DEBUG" "$*"
+    fi
+}
+
+prepare_logging() {
+    local log_dir
+    log_dir="$(dirname "$log_file")"
+    mkdir -p "$log_dir" 2>/dev/null || true
+}
+
+require_command() {
+    local required="$1"
+
+    if ! command -v "$required" >/dev/null 2>&1; then
+        log_error "Required command is missing: $required"
+        return 1
+    fi
+
+    return 0
+}
+
+on_exit() {
+    local rc="$1"
+
+    if [[ "$rc" -eq 0 ]]; then
+        log_info "Finished with rc=$rc"
+    else
+        log_error "Finished with rc=$rc"
+    fi
+}
+
+sanitize_for_log() {
+    local text="$*"
+
+    text="${text//$'\r'/ }"
+    text="${text//$'\n'/ }"
+    text="$(printf '%s\n' "$text" | awk '{$1=$1; print}')"
+    printf '%s\n' "$text"
+}
+
+controller_powered_on() {
+    local show_out
+    show_out=$(timeout "${probe_timeout_seconds}s" bluetoothctl show 2>/dev/null || true)
+    [[ "$show_out" == *"Powered: yes"* ]]
+}
+
+ensure_controller_powered() {
+    local power_out
+
+    if controller_powered_on; then
+        return 0
+    fi
+
+    power_out=$(timeout "${probe_timeout_seconds}s" bluetoothctl power on 2>&1 || true)
+    power_out="$(sanitize_for_log "$power_out")"
+    if [[ -n "$power_out" ]]; then
+        log_warn "Controller was not powered; bluetoothctl power on => $power_out"
+    else
+        log_warn "Controller was not powered; issued bluetoothctl power on"
+    fi
+}
+
+l2ping_available() {
+    command -v l2ping >/dev/null 2>&1
+}
+
+l2ping_device_present() {
+    local out
+
+    out=$(timeout "${l2ping_timeout_seconds}s" l2ping -c 1 "$mac_address" 2>&1 || true)
+    out="$(sanitize_for_log "$out")"
+
+    if [[ "$out" == *"1 received"* || "$out" == *"0% loss"* ]]; then
+        log_debug "l2ping succeeded: $out"
+        return 0
+    fi
+
+    log_debug "l2ping failed: ${out:-no output}"
+    return 1
+}
+
+first_user_session() {
+    loginctl list-sessions --no-legend 2>/dev/null | awk '$6=="user" {print $1":"$3; exit}'
+}
+
+locked_hint_for_session() {
+    loginctl show-session "$1" -p LockedHint --value 2>/dev/null || echo unknown
+}
+
+session_active_for_session() {
+    loginctl show-session "$1" -p Active --value 2>/dev/null || echo unknown
+}
+
+qdbus_bin() {
+    command -v qdbus6 || command -v qdbus || true
+}
+
+screensaver_active_for_user() {
+    local target_user="$1"
+    local uid bus_path qdbus out
+
+    uid=$(id -u "$target_user" 2>/dev/null) || {
+        echo unknown
+        return 1
+    }
+
+    bus_path="/run/user/$uid/bus"
+    qdbus=$(qdbus_bin)
+
+    if [[ ! -S "$bus_path" || -z "$qdbus" ]]; then
+        echo unknown
+        return 1
+    fi
+
+    out=$(sudo -n -u "$target_user" DBUS_SESSION_BUS_ADDRESS="unix:path=$bus_path" \
+        "$qdbus" org.freedesktop.ScreenSaver /ScreenSaver org.freedesktop.ScreenSaver.GetActive 2>/dev/null) || {
+        echo unknown
+        return 1
+    }
+
+    out="${out//$'\r'/}"
+    out="${out//$'\n'/}"
+
+    if [[ "$out" == "true" || "$out" == "false" ]]; then
+        echo "$out"
+        return 0
+    fi
+
+    echo unknown
+    return 1
+}
+
+session_is_unlocked_and_active() {
+    local session_id="$1"
+    local session_user="$2"
+    local locked active saver
+
+    locked=$(locked_hint_for_session "$session_id")
+    active=$(session_active_for_session "$session_id")
+    saver=$(screensaver_active_for_user "$session_user")
+
+    if [[ "$locked" == "no" && "$active" == "yes" && "$saver" != "true" ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+unlock_session() {
+    local session_id="$1"
+    local session_user="$2"
+    local uid bus_path qdbus
+
+    loginctl unlock-session "$session_id" >/dev/null 2>&1 || true
+    loginctl unlock-sessions >/dev/null 2>&1 || true
+
+    uid=$(id -u "$session_user" 2>/dev/null) || return 0
+    bus_path="/run/user/$uid/bus"
+    qdbus=$(qdbus_bin)
+
+    if [[ -S "$bus_path" && -n "$qdbus" ]]; then
+        sudo -n -u "$session_user" DBUS_SESSION_BUS_ADDRESS="unix:path=$bus_path" \
+            "$qdbus" org.freedesktop.ScreenSaver /ScreenSaver org.freedesktop.ScreenSaver.SetActive false \
+            >/dev/null 2>&1 || true
+    fi
+}
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    if command -v sudo >/dev/null 2>&1; then
+        exec sudo -n \
+            --preserve-env=BLUETOOTH_UNLOCK_TIMEOUT_SECONDS,BLUETOOTH_UNLOCK_POLL_INTERVAL_SECONDS,BLUETOOTH_UNLOCK_PROBE_TIMEOUT_SECONDS,BLUETOOTH_UNLOCK_RESUME_SETTLE_SECONDS,BLUETOOTH_UNLOCK_CONNECT_TIMEOUT_SECONDS,BLUETOOTH_UNLOCK_CONNECT_RETRY_SECONDS,BLUETOOTH_UNLOCK_CONNECT_BUSY_RETRY_SECONDS,BLUETOOTH_UNLOCK_MIN_RSSI,BLUETOOTH_UNLOCK_L2PING_TIMEOUT_SECONDS,BLUETOOTH_UNLOCK_LOG_FILE,BLUETOOTH_UNLOCK_LOG_TAG,BLUETOOTH_UNLOCK_DEBUG,BLUETOOTH_UNLOCK_RUN_ID \
+            "$0" "$@"
+    fi
+    echo "bluetooth_unlock requires root privileges (sudo is unavailable)." >&2
+    exit 0
+fi
+
+prepare_logging
+trap 'on_exit $?' EXIT
+
+log_info "Started: mac=$mac_address timeout=${timeout_seconds}s poll=${poll_interval_seconds}s min_rssi=$min_rssi debug=$debug_enabled"
+
+for required_cmd in hcitool bluetoothctl timeout loginctl flock; do
+    if ! require_command "$required_cmd"; then
+        exit 1
+    fi
+done
+
+if l2ping_available; then
+    log_info "l2ping probe is available"
+else
+    log_warn "l2ping is unavailable; presence checks rely on bluetoothctl/hcitool only"
+fi
+
+exec 9>"$lock_file"
+if ! flock -n 9; then
+    log_info "Another run already holds lock ($lock_file), exiting"
+    exit 0
+fi
+
+log_info "Acquired lock ($lock_file)"
+ensure_controller_powered
+
+if (( resume_settle_seconds > 0 )); then
+    log_debug "Waiting ${resume_settle_seconds}s for system to settle after resume"
+    sleep "$resume_settle_seconds"
+fi
+
+end_time=$((SECONDS + timeout_seconds))
+saw_locked=0
+next_connect_try=0
+
+while [[ $SECONDS -lt $end_time ]]; do
+    session_pair=$(first_user_session)
+    session_id="${session_pair%%:*}"
+    session_user="${session_pair#*:}"
+
+    if [[ -z "$session_id" || "$session_id" == "$session_pair" ]]; then
+        log_debug "No user session found yet"
+        sleep "$poll_interval_seconds"
+        continue
+    fi
+
+    locked_before=$(locked_hint_for_session "$session_id")
+    active_before=$(session_active_for_session "$session_id")
+    saver_before=$(screensaver_active_for_user "$session_user")
+    log_debug "session=$session_id user=$session_user locked=$locked_before active=$active_before saver=$saver_before"
+
+    if [[ "$locked_before" == "yes" || "$active_before" == "no" || "$saver_before" == "true" ]]; then
+        if (( saw_locked == 0 )); then
+            log_info "Detected locked or inactive session; unlock watch is now active"
+        fi
+        saw_locked=1
+    fi
+
+    if (( saw_locked == 1 )) && session_is_unlocked_and_active "$session_id" "$session_user"; then
+        log_info "Session is already unlocked and active; nothing to do"
+        exit 0
+    fi
+
+    btinfo=$(timeout "${probe_timeout_seconds}s" bluetoothctl info "$mac_address" 2>/dev/null || true)
+    connected=no
+    if [[ "$btinfo" == *"Connected: yes"* ]]; then
+        connected=yes
+    fi
+
+    if [[ "$connected" == "no" && $SECONDS -ge $next_connect_try ]]; then
+        ensure_controller_powered
+        log_info "Device not connected; trying bluetoothctl connect $mac_address"
+        connect_out=$(timeout "${connect_timeout_seconds}s" bluetoothctl connect "$mac_address" 2>&1 || true)
+        connect_out="$(sanitize_for_log "$connect_out")"
+
+        retry_delay="$connect_retry_seconds"
+        if [[ "$connect_out" == *"org.bluez.Error.InProgress"* || "$connect_out" == *"br-connection-busy"* ]]; then
+            retry_delay="$connect_busy_retry_seconds"
+            log_warn "Connect is busy/in-progress; delaying retry to ${retry_delay}s"
+            timeout "${probe_timeout_seconds}s" bluetoothctl disconnect "$mac_address" >/dev/null 2>&1 || true
+        elif [[ -n "$connect_out" && "$connect_out" != *"Connection successful"* ]]; then
+            log_warn "Connect attempt output: $connect_out"
+        else
+            log_debug "Connect attempt output: ${connect_out:-no output}"
+        fi
+        next_connect_try=$((SECONDS + retry_delay))
+
+        btinfo=$(timeout "${probe_timeout_seconds}s" bluetoothctl info "$mac_address" 2>/dev/null || true)
+        if [[ "$btinfo" == *"Connected: yes"* ]]; then
+            connected=yes
+            log_info "Device connected after retry"
+        else
+            log_debug "Connect retry did not establish connection"
+        fi
+    fi
+
+    bt=$(timeout "${probe_timeout_seconds}s" hcitool rssi "$mac_address" 2>/dev/null || true)
+    rssi_value=""
+    if [[ "$bt" =~ RSSI[[:space:]]return[[:space:]]value:[[:space:]](-?[0-9]+) ]]; then
+        rssi_value="${BASH_REMATCH[1]}"
+    fi
+
+    present=no
+    if [[ "$connected" == "yes" ]]; then
+        present=yes
+    elif [[ -n "$rssi_value" ]] && (( rssi_value >= min_rssi )); then
+        present=yes
+    elif l2ping_available && l2ping_device_present; then
+        present=yes
+    fi
+    log_debug "presence connected=$connected rssi=${rssi_value:-n/a} min_rssi=$min_rssi present=$present"
+
+    if [[ "$present" == "yes" ]]; then
+        log_info "Device considered present; attempting unlock for session=$session_id user=$session_user"
+        unlock_session "$session_id" "$session_user"
+        sleep 0.2
+
+        if session_is_unlocked_and_active "$session_id" "$session_user"; then
+            log_info "Unlock confirmed"
+            exit 0
+        fi
+
+        log_warn "Unlock command ran but session is still not confirmed unlocked"
+    fi
+
+    sleep "$poll_interval_seconds"
+done
+
+log_warn "Timed out after ${timeout_seconds}s without confirmed unlock"
+exit 0
